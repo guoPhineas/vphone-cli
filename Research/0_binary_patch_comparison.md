@@ -1,5 +1,44 @@
 # Patch Comparison: Regular / Development / Jailbreak / Experimental
 
+> **Experimental Duo CSSC compatibility (2026-10-25).**
+> The existing iOS 27 ARM64E_X1 executable/bootstrap-cache patches also
+> recognize scalar CSSC ABS/CNT/CTZ and signed/unsigned MIN/MAX, including
+> immediate forms. Startup sites branch to baseline A64 thunks in verified
+> zero-filled RX padding outside the image's sections and header. The cache
+> also admits entirely zero-filled 4 KiB alignment tails between adjacent
+> image segments, bounded by one executable mapping. Register-free B relays
+> bridge the 128 MiB branch limit. CSSC requests across the bootstrap closure
+> are planned together, constrained sites first, using a shared pool without a
+> fixed relay reservation. Placement tries both gap ends and rolls back a
+> failed round trip before trying another gap. Register MIN/MAX uses a
+> 12-byte fallback only when a bounded straight-line proof shows incoming
+> NZCV overwritten before use. Immediate MIN/MAX can reuse a destination
+> distinct from its source under the same proof; other sites retain the
+> preserving fallback. A failed direct-first plan retries once from pristine
+> padding with larger thunks placed remotely; disconnected regions are
+> excluded before candidate routing.
+> Address layout stays fixed; thunks preserve NZCV, scratch registers, LR and Darwin's
+> 128-byte red zone except for the instruction's destination; the short form
+> changes only flags proven dead. Missing padding
+> fails the plan before any write. Cache pages retain the existing undo and
+> re-attestation path; standalone binaries retain code-slot re-attestation.
+> The launchd exception service additionally emulates later CSSC faults by
+> updating the destination register and PC, without modifying signed pages.
+> Its native-feature probe includes CSSC. Existing patch declarations own
+> these changes; no kernel patch, new preset, or version change is introduced.
+> This is an attempt to address Duo 24A94425's PID 1 SIGILL on the M3 Pro,
+> not a successful guest boot fix. The final real-cache plan still fails;
+> subsequent independent-clone tracing attributes the installed image's fatal
+> instruction to PACIBSPPC in libSystem.B.dylib, left unconverted when CSSC
+> planning aborted the whole cache operation. See the bring-up record for the
+> captured PC, ESR and exception codes.
+> PR #728 addresses X1 cache performance on CSSC-capable hosts and is not
+> included. Verification results and remaining limitations are recorded in
+> `Research/Guest/iphone_duo_bringup.md`. Selected X1 boot-patch failures now
+> abort installation before setup boot; optional patch failures keep their
+> existing handling. The revised planner's validation is recorded there;
+> successful guest boot and fault-PC attribution remain unverified.
+
 > **HomePod local app installation (2026-10-23).**
 > `system-installd-exp-homepod_adhoc` is selected only by `homepod-mini` on
 > HomePod 27. It loads a dedicated TVOS arm64e build of the existing MIS

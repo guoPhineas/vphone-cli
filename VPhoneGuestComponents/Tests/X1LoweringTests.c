@@ -1,4 +1,5 @@
 #include "../LaunchHook/VPhoneX1Lowering.h"
+#include "../LaunchHook/VPhoneCSSCEmulation.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +17,46 @@ static void reject(uint32_t input) {
 }
 
 int main(void) {
+    uint64_t registers[31] = {0};
+    const uint32_t unary[] = {0x5AC02000, 0x5AC01C00, 0x5AC01800};
+    for (unsigned wide = 0; wide < 2; wide++) {
+        uint32_t sf = wide ? 0x80000000 : 0;
+        uint64_t sign = UINT64_C(1) << (wide ? 63 : 31);
+        registers[1] = sign;
+        assert(vp_cssc_emulate(sf | unary[0] | (1 << 5), registers));
+        assert(registers[0] == sign); // ABS(INT_MIN) wraps, does not saturate.
+        registers[1] = UINT64_MAX;
+        assert(vp_cssc_emulate(sf | unary[1] | (1 << 5), registers));
+        assert(registers[0] == (wide ? 64 : 32));
+        registers[1] = 0;
+        assert(vp_cssc_emulate(sf | unary[2] | (1 << 5), registers));
+        assert(registers[0] == (wide ? 64 : 32));
+        registers[1] = UINT64_C(1) << 31;
+        assert(vp_cssc_emulate(sf | unary[2] | (1 << 5) | 1, registers));
+        assert(registers[1] == 31); // Destination aliases the source.
+        for (unsigned kind = 0; kind < 4; kind++) {
+            registers[1] = wide ? UINT64_MAX : UINT32_MAX;
+            registers[2] = 7;
+            uint32_t reg_op = sf | (0x1AC06000 + kind * 0x400) | (2 << 16) | (1 << 5) | 2;
+            assert(vp_cssc_emulate(reg_op, registers));
+            uint64_t expected = (kind == 0 || kind == 3) ? 7 : (wide ? UINT64_MAX : UINT32_MAX);
+            assert(registers[2] == expected);
+            // Signed immediate -1 and unsigned immediate 255.
+            registers[1] = 0;
+            uint32_t imm_op = sf | (0x11C00000 + kind * 0x40000) | (255 << 10) | (1 << 5);
+            assert(vp_cssc_emulate(imm_op, registers));
+            const uint64_t expected_imm[] = {0, 255, wide ? UINT64_MAX : UINT32_MAX, 0};
+            assert(registers[0] == expected_imm[kind]);
+        }
+        registers[0] = 123;
+        assert(vp_cssc_emulate(sf | unary[2] | (31 << 5) | 31, registers));
+        assert(registers[0] == 123); // ZR writes are discarded, not SP writes.
+    }
+    registers[0] = 456;
+    assert(!vp_cssc_emulate(0xD503201F, registers));
+    assert(!vp_cssc_emulate(0x4E205800, registers)); // NEON CNT is not scalar CSSC.
+    assert(registers[0] == 456);
+    assert(!vp_cssc_emulate(0xDAC01800, NULL));
     expect(0xDAC1A7FE, 0xD503237F); // PACIBSPPC -> PACIBSP
     expect(0xDAC187FE, 0xD503237F); // PACNBIBSPPC -> PACIBSP
     expect(0xDAC1A3FE, 0xD503233F); // PACIASPPC -> PACIASP

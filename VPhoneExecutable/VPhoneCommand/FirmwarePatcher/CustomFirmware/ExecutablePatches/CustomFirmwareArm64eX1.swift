@@ -70,18 +70,28 @@ public enum CustomFirmwareArm64eX1 {
             ranges.append((start, data.subdata(in: start ..< start + size)))
         }
         let original = data
-        let result = try planCode(ranges: ranges, seeds: seeds, excluded: excluded,
-                                  identifier: identifier, readMemory: { address, length in
+        let cssc = try CustomFirmwareCSSC.Padding(ranges: CustomFirmwareCSSC.padding(in: data)) { address, length in
+            guard address >= 0, address <= original.count, length <= original.count - address else {
+                throw PatcherError.invalidFormat("CSSC padding outside Mach-O")
+            }
+            return original.subdata(in: address ..< address + length)
+        }
+        let planned = try planCode(ranges: ranges, seeds: seeds, excluded: excluded,
+                                  identifier: identifier, cssc: cssc, readMemory: { address, length in
             guard address <= original.count, length <= original.count - address else {
                 throw PatcherError.invalidFormat("X1 switch table outside image")
             }
             return original.subdata(in: address ..< address + length)
         })
+        let records = (planned.records + (try cssc.finish())).sorted { $0.fileOffset < $1.fileOffset }
+        let result = Result(records: records, unvisitedCandidates: planned.unvisitedCandidates,
+                            unvisitedExamples: planned.unvisitedExamples)
         for record in result.records { data.replaceSubrange(record.fileOffset ..< record.fileOffset + 4, with: record.patchedBytes) }
         return result
     }
 
     static func planCode(ranges: [(address: Int, data: Data)], seeds: [Int], excluded: [Range<Int>], identifier: String,
+                         cssc: CustomFirmwareCSSC.Padding? = nil,
                          readMemory: ((Int, Int) throws -> Data)? = nil,
                          authenticatedPointer: ((UInt64, UInt16) throws -> UInt64?)? = nil) throws -> Result {
         let decoder = ARM64Disassembler()
@@ -95,7 +105,9 @@ public enum CustomFirmwareArm64eX1 {
                 for (index, item) in decoded.enumerated() where item.address < UInt64(range.address + block + 0x4000) {
                     let address = Int(item.address)
                     guard !excluded.contains(where: { $0.contains(address) }) else { continue }
-                    if loweredMnemonics.contains(item.mnemonic) { candidates.append(address) }
+                    if loweredMnemonics.contains(item.mnemonic) || CustomFirmwareCSSC.Operation(item) != nil {
+                        candidates.append(address)
+                    }
                     if ["pacibsppc", "paciasppc", "pacnbibsppc", "pacnbiasppc", "pacibsp", "paciasp"].contains(item.mnemonic), index + 1 < decoded.count {
                         let next = decoded[index + 1], ops = next.detail?.operands ?? []
                         let savesFrame = ["stp", "str"].contains(next.mnemonic) && ops.last?.type == .memory && ops.last?.mem.base == .sp
@@ -141,10 +153,15 @@ public enum CustomFirmwareArm64eX1 {
             }
         }
         var records: [PatchRecord] = []
+        var csscRequests: [CustomFirmwareCSSC.Request] = []
         while let entry = pending.popLast() {
             var offset = entry
             while visited.insert(offset).inserted, let instruction = decodedInstruction(at: offset), instruction.isDecoded, instruction.size == 4 {
-                if let replacement = try replacement(for: instruction) {
+                if CustomFirmwareCSSC.Operation(instruction) != nil {
+                    guard cssc != nil else { throw PatcherError.invalidFormat("CSSC startup instruction requires executable padding") }
+                    csscRequests.append(.init(instruction: instruction, identifier: identifier,
+                        flagsDead: CustomFirmwareCSSC.flagsAreDead(after: offset, instructionAt: decodedInstruction(at:))))
+                } else if let replacement = try replacement(for: instruction) {
                     let after = decoder.disassembleOne(replacement, at: instruction.address)
                     records.append(PatchRecord(patchID: identifier + ".\(offset)", component: "Mach-O", fileOffset: offset,
                         originalBytes: Data(instruction.bytes), patchedBytes: replacement,
@@ -182,6 +199,9 @@ public enum CustomFirmwareArm64eX1 {
             }
         }
         records.removeAll { record in dataRanges.contains(where: { $0.contains(record.fileOffset) }) }
+        cssc?.append(csscRequests.filter { request in
+            !dataRanges.contains(where: { $0.contains(Int(request.instruction.address)) })
+        })
         let unvisited = candidates.filter { address in !visited.contains(address) && !dataRanges.contains(where: { $0.contains(address) }) }
         records.sort { $0.fileOffset < $1.fileOffset }
         return Result(records: records, unvisitedCandidates: unvisited.count, unvisitedExamples: Array(unvisited.prefix(16)))

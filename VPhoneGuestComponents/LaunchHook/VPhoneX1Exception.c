@@ -1,5 +1,6 @@
 #include "VPhoneX1Exception.h"
 #include "VPhoneX1Lowering.h"
+#include "VPhoneCSSCEmulation.h"
 #include "mach_exc.h"
 #include "mach_excServer.h"
 
@@ -18,6 +19,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <ptrauth.h>
 
 extern const struct mach_header *_NSGetMachExecuteHeader(void);
 
@@ -41,6 +43,15 @@ static uintptr_t vp_probe_cpa(uintptr_t unused, uintptr_t base,
     uintptr_t offset) {
     __asm__ volatile(
         ".long 0x9A022020\n" // ADDPT x0, x1, x2
+        "ret\n"
+    );
+}
+
+__attribute__((naked, noinline, used))
+static void vp_probe_cssc(void) {
+    __asm__ volatile(
+        "mov x0, #0\n"
+        ".long 0xDAC01800\n" // CTZ x0, x0
         "ret\n"
     );
 }
@@ -104,6 +115,14 @@ static bool vp_is_x1_launchd(void) {
     return header->cputype == CPU_TYPE_ARM64 && subtype == 12;
 }
 
+static void *vp_cssc_state_pointer(uintptr_t value) {
+#if __has_feature(ptrauth_calls)
+    return ptrauth_sign_unauthenticated((void *)value, ptrauth_key_function_pointer, 0);
+#else
+    return (void *)value;
+#endif
+}
+
 static bool vp_patch_fault(mach_port_t thread, mach_port_t task,
     const mach_exception_data_t code, mach_msg_type_number_t code_count) {
     if (code_count != 2) return false;
@@ -112,12 +131,38 @@ static bool vp_patch_fault(mach_port_t thread, mach_port_t task,
     mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state,
             &state_count) != KERN_SUCCESS) return false;
+    arm_thread_state64_t updated = state;
     // The remote thread owns the PC signature; inspect a stripped copy.
     arm_thread_state64_ptrauth_strip(state);
     vm_address_t pc = (vm_address_t)arm_thread_state64_get_pc(state);
     if ((pc & 3) != 0) return false;
 
     uint32_t fault_word = (uint32_t)code[1];
+    uint64_t registers[31];
+    for (unsigned index = 0; index < 29; index++) registers[index] = state.__x[index];
+    registers[29] = arm_thread_state64_get_fp(state);
+    registers[30] = arm_thread_state64_get_lr(state);
+    if (vp_cssc_emulate(fault_word, registers)) {
+        uint32_t current = 0;
+        vm_size_t read = 0;
+        if (vm_read_overwrite(task, pc, sizeof(current), (vm_address_t)&current, &read) != KERN_SUCCESS ||
+            read != sizeof(current) || current != fault_word) return false;
+        unsigned rd = fault_word & 31;
+        if (rd < 29) updated.__x[rd] = registers[rd];
+        else if (rd == 29) {
+            arm_thread_state64_set_fp(updated, registers[rd]);
+            if (arm_thread_state64_get_fp(updated) != registers[rd]) return false;
+        } else if (rd == 30) {
+            arm_thread_state64_set_lr_fptr(updated, vp_cssc_state_pointer(registers[rd]));
+            if (arm_thread_state64_get_lr(updated) != registers[rd]) return false;
+        }
+        // Preserve the authenticated state of all untouched pointer fields.
+        // NO_PTRAUTH state is refused by a JOP-enabled destination. The SDK
+        // setter signs the new PC with its recorded user diversifier instead.
+        arm_thread_state64_set_pc_fptr(updated, vp_cssc_state_pointer(pc + 4));
+        return thread_set_state(thread, ARM_THREAD_STATE64, (thread_state_t)&updated,
+            ARM_THREAD_STATE64_COUNT) == KERN_SUCCESS;
+    }
     uint32_t replacement;
     if (!vp_x1_lower_instruction(fault_word, &replacement)) return false;
 
@@ -240,6 +285,7 @@ static bool vp_probe_native_x1(void) {
             uintptr_t marker = 0;
             vp_probe_pauth_lr();
             (void)vp_probe_cpa(0, (uintptr_t)&marker, 0);
+            vp_probe_cssc();
             supported = 1;
         }
         (void)write(result_pipe[1], &supported, sizeof(supported));

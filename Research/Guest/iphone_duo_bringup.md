@@ -108,3 +108,108 @@ The original manifests and device tree were extracted by HTTP ranges with
 the repository's `VPhoneRemoteZip`. Raw logs and scratch artifacts remain
 local; host paths, per-machine identifiers and runtime addresses are not
 included in this research record.
+
+## Experimental CSSC fallback (2026-10-25)
+
+The M3 Pro repro uses the same 24A94425 userland and cloudOS 26.4 kernel
+UUID recorded above. Its console reports PID 1 SIGILL; host sysctl reports
+CSSC, CPA and PAuth_LR absent. The fault PC is still not captured. PR #728
+reports a successful boot on an M5 Pro with native CSSC, then fixes later
+X1 fault volume, audio and service-profile issues. That PR adds no CSSC
+fallback and is not incorporated here.
+
+This branch extends the existing X1 bootstrap patches rather than adding
+a kernel instruction emulator. CSSC sites keep their original address and
+branch to baseline A64 thunks in verified zero-filled, executable segment
+padding outside load commands and all sections. Cached thunks can additionally
+use entirely zero-filled 4 KiB alignment tails between adjacent image segments,
+after subtracting all image segment ranges and checking a single executable
+cache mapping. B-only relays bridge the 128 MiB direct-branch limit without
+clobbering LR or another register. Each relay reserves two adjacent branch
+words for entry and return together; the entry path cannot consume the final
+bridge needed to return. Requests from all bootstrap images are
+collected before allocation, with sites having less direct capacity handled
+first. Thunks and relays share one pool; there is no fixed percentage reserved
+for either. Both ends of candidate gaps are considered, direct round trips
+take priority, and a failed outbound/return allocation rolls back before the
+next candidate is tried. If the complete direct-first plan fails, a bounded
+second pass restores the original pool, places short thunks before relay pairs
+fragment their local slots, then tries larger thunks remotely. Optimistic reachability bounds exclude cache
+regions disconnected from the site before routing tries candidate gaps.
+Both failed passes restore the original pool.
+Planning
+refuses missing space or an unreachable path before writing. The existing
+re-attestation, original backups and cache undo records cover every changed
+word, including thunks and relays. Scratch registers, NZCV and the 128-byte
+Darwin red zone are preserved; W-register results clear their upper 32 bits.
+
+Register MIN/MAX can use CMP/CSEL/B (12 bytes instead of 36) when the next
+16 instructions contain a proven independent NZCV overwrite before any use.
+The proof accepts only known flag-transparent integer and load/store operations and stops
+at calls, branches, returns, conditional operations, carry-dependent writes,
+system-register accesses, unknown instructions or a missing decode. Other
+forms and inconclusive sites keep their complete preserving fallback. For an
+immediate MIN/MAX with the same NZCV proof, a destination distinct from the
+source can hold the immediate without a scratch register; source/destination
+aliases keep the preserving form. Existing encoders generate these sequences.
+
+The runtime fallback evaluates scalar ABS, CNT, CTZ, SMAX, SMIN, UMAX and UMIN
+(register and immediate forms), updates only the destination and PC, and
+forwards unknown encodings. Native capability probing includes CSSC.
+Runtime-emulated sites fault on every execution, so this is a correctness
+fallback, not a performance claim. Other X1 cache faults still use the
+existing path on this branch; #728's performance work remains complementary.
+
+Read-only inspection of the installed standalone images found 80 CSSC sites
+in dyld and 9 in launchd. Patched scratch copies have no scalar CSSC remaining
+in their instruction sections; all 343 dyld and 150 launchd SHA-256 code slots
+were independently verified. Host execution checks 140 generated fallback
+cases, including W/X results, aliases, flags, scratch registers and red-zone
+preservation. The portable C emulator and arm64e guest dylib build also pass.
+New instruction encoders were checked with Keystone 0.9.2 outside the repository.
+
+The preceding implementation passed 94 tests in 12 suites, covering CSSC, existing X1 lowering,
+cache bootstrap planning fixtures, encoders and the required patch catalogue,
+version, selection, declaration, resolution and gate suites. The complete
+`VPhone` workspace build and bundle admission pass.
+
+**The preceding real-cache dry-run failed.** That cache validation used the
+user-selected VM's iOS 27.1 (24A94425) volume, with the mounted backing image
+checked separately from the mountpoint name. Segment-internal padding alone runs
+out near Foundation. Inter-image alignment tails, compact thunks and B-only
+relays let planning finish Foundation and libswiftCore, but a later bootstrap
+CSSC site could not reach the remaining thunk space. The allocator refused
+the complete plan before any file write. The revised global allocator and
+short thunks require a new cache dry-run after the implementation is complete.
+Do not infer native-CSSC-host compatibility
+from the host unit tests either: the new static lowering currently runs for
+X1 inputs regardless of the host's CSSC support.
+
+The creation log also showed the failed bootstrap patch being reported as a
+warning, after which installation continued and setup boot panicked. Selected
+X1 patches for dyld, launchd, fsck, mount and the bootstrap cache now abort
+installation on failure. Cache failures retain their underlying error in the
+thrown message; optional audio and other patches retain their existing policy.
+This error handling prevents a misleading later connect failure; it does not
+establish the instruction responsible for the original panic.
+
+The final revision passed 122 tests in 13 suites, the guest lowering tests,
+and the complete VPhone Debug bundle build and admission. Its actual Banana
+cache dry-run still failed after planning 10,559 of 11,523 CSSC sites: a
+36-byte SMIN fallback at 0x1832f72f0 had no contiguous reachable candidate.
+The failed plan wrote no cache files. This branch is an experimental checkpoint,
+not a successful M3 Pro boot fix; allocator tuning is discontinued.
+
+A separate boot of an independent Banana disk clone captured the actual fatal
+instruction in the same research kernel UUID: saved EL0 PC 0x2bd6380e8,
+ESR 0x02000000, and runtime exception codes {1, 0xdac1a7fe}. The word is
+PACIBSPPC, in /usr/lib/libSystem.B.dylib at image offset 0x10e8, and matches
+the original cache chunk. The kernel's user-instruction copy and exception
+code stores were verified in its live disassembly. Thus this installed image
+dies on PAuth_LR before a CSSC fault has been demonstrated. The creation log
+shows CSSC planning failing the entire X1 cache operation, leaving the existing
+PAuth/CPA conversion unapplied while installation continued. CSSC remains a
+separate confirmed host compatibility gap.
+
+No source VM disk has been written or redeployed. The diagnostic clone was
+stopped after capture. Entering SpringBoard on this host remains unverified.

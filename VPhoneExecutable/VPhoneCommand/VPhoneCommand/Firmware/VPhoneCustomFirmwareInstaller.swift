@@ -1235,7 +1235,9 @@ struct VPhoneCustomFirmwareInstaller {
     /// no restore-tree step runs.
     ///
     /// Paired TV dyld updates abort on failure and discard the private disk
-    /// clone, preserving the original disk and receipt. Other patches run in isolation: one patch failing — a verb rejecting an
+    /// clone, preserving the original disk and receipt. Selected X1 bootstrap
+    /// patches also abort on failure: continuing would boot an incompatible
+    /// cache or executable. Other patches run in isolation: one patch failing — a verb rejecting an
     /// unexpected prologue on an older VM, say — is reported and the patch is
     /// left in its prior state, but the run continues and the vphoned redeploy,
     /// done first, is never blocked. Non-patch failures (a volume that will not
@@ -1367,17 +1369,36 @@ struct VPhoneCustomFirmwareInstaller {
         }
         let version = try productVersion(system: system)
 
+        func requireX1Bootstrap() throws {
+            let required: Set<String> = [
+                FirmwareGuestSystemPatchSet.arm64eX1DyldBootstrap,
+                FirmwareGuestSystemPatchSet.arm64eX1CacheBootstrap,
+                FirmwareGuestSystemPatchSet.arm64eX1LaunchdBootstrap,
+                FirmwareGuestSystemPatchSet.arm64eX1FsckBootstrap,
+                FirmwareGuestSystemPatchSet.arm64eX1MountBootstrap,
+            ]
+            let failed = Set(failures).intersection(required).filter {
+                plan?.isEnabled($0) ?? version.hasPrefix("27.")
+            }.sorted()
+            guard failed.isEmpty else {
+                throw ValidationError("Required X1 boot patches failed; installation stopped before setup boot: \(failed.joined(separator: ", ")). See the patch error above.")
+            }
+        }
+
         if version.hasPrefix("27.") || priorGuest.contains(FirmwareGuestSystemPatchSet.arm64eX1DyldBootstrap) {
             machO(FirmwareGuestSystemPatchSet.arm64eX1DyldBootstrap, path: "usr/lib/dyld",
                   verbs: ["patch-arm64e-x1"], preserveEntitlements: true)
+            try requireX1Bootstrap()
         }
         if version.hasPrefix("27.") || priorGuest.contains(FirmwareGuestSystemPatchSet.arm64eX1FsckBootstrap) {
             machO(FirmwareGuestSystemPatchSet.arm64eX1FsckBootstrap, path: "sbin/fsck",
                   verbs: ["patch-arm64e-x1"], preserveEntitlements: true)
+            try requireX1Bootstrap()
         }
         if version.hasPrefix("27.") || priorGuest.contains(FirmwareGuestSystemPatchSet.arm64eX1MountBootstrap) {
             machO(FirmwareGuestSystemPatchSet.arm64eX1MountBootstrap, path: "sbin/mount",
                   verbs: ["patch-arm64e-x1"], preserveEntitlements: true)
+            try requireX1Bootstrap()
         }
 
         // 0. A cache whose span alone overruns the guest kernel's shared region
@@ -1594,10 +1615,11 @@ struct VPhoneCustomFirmwareInstaller {
             ("dyld-exp-hv_vmm", "patch-hv-vmm-dsc", [dsc]),
             ("dyld-cfw-camera", "patch-camera-dsc", [dsc, DyldSharedCacheChunkSet.mainCacheURL(in: URL(fileURLWithPath: dsc)).path]),
         ]
-        applyDyldPatches(
+        try applyDyldPatches(
             dyld, dsc: dsc, cacheRelative: cacheRelative, system: system, plan: plan, priorGuest: priorGuest,
             live: &live, failures: &failures,
         )
+        try requireX1Bootstrap()
 
         // The feature plist exists from iOS 26. Turning the patch off restores
         // the original.
@@ -1930,6 +1952,7 @@ struct VPhoneCustomFirmwareInstaller {
             }
         }
 
+        try requireX1Bootstrap()
         if !isHomePod {
             isolate([]) { try restoreMISFixTargets(system: system) }
         }
@@ -2078,7 +2101,8 @@ struct VPhoneCustomFirmwareInstaller {
     /// multi-gigabyte scan when nothing changed. A disabled patch with no undo
     /// record was either never applied (nothing to do) or applied before the
     /// undo log existed; the latter is told apart by the prior-live set and
-    /// reported as not revertible, staying live. Each verb runs in isolation.
+    /// reported as not revertible, staying live. The selected X1 bootstrap
+    /// patch must succeed; optional cache patches still run in isolation.
     private func applyDyldPatches(
         _ dyld: [(id: String, verb: String, args: [String])],
         dsc: String,
@@ -2088,9 +2112,14 @@ struct VPhoneCustomFirmwareInstaller {
         priorGuest: Set<String>,
         live: inout Set<String>,
         failures: inout [String],
-    ) {
+    ) throws {
         func enabled(_ id: String) -> Bool {
             plan?.isEnabled(id) ?? !FirmwareGuestSystemPatchSet.settingsRowPatches.contains(id)
+        }
+        func requireBootstrap(_ id: String, error: any Error) throws {
+            if id == FirmwareGuestSystemPatchSet.arm64eX1CacheBootstrap {
+                throw ValidationError("Required X1 boot patch \(id) failed; installation stopped before setup boot: \(error)")
+            }
         }
         let undoAbsolute = (dsc as NSString).appendingPathComponent(Self.dscUndoLogLeaf)
         let undoRelative = "\(cacheRelative)/\(Self.dscUndoLogLeaf)"
@@ -2112,6 +2141,7 @@ struct VPhoneCustomFirmwareInstaller {
                     } catch {
                         failures.append(entry.id)
                         print("  [!] \(entry.id): re-running the applied patch failed, left as it was: \(error)")
+                        try requireBootstrap(entry.id, error: error)
                     }
                 } else if let undoLog, undoLog.hasOutdatedImplementation(of: entry.id) {
                     print("  [*] \(entry.id): an earlier implementation is applied; reverting it and applying the current one")
@@ -2121,6 +2151,7 @@ struct VPhoneCustomFirmwareInstaller {
                         failures.append(entry.id)
                         live.insert(entry.id)
                         print("  [!] \(entry.id): reverting the earlier implementation failed, left as it was: \(error)")
+                        try requireBootstrap(entry.id, error: error)
                         continue
                     }
                     do {
@@ -2128,6 +2159,7 @@ struct VPhoneCustomFirmwareInstaller {
                     } catch {
                         failures.append(entry.id)
                         print("  [!] \(entry.id): the earlier implementation was reverted but the current one failed; the cache is unpatched for it: \(error)")
+                        try requireBootstrap(entry.id, error: error)
                         continue
                     }
                 }
@@ -2139,6 +2171,7 @@ struct VPhoneCustomFirmwareInstaller {
                 } catch {
                     failures.append(entry.id)
                     print("  [!] \(entry.id): dyld patch failed, left in its prior state: \(error)")
+                    try requireBootstrap(entry.id, error: error)
                 }
             case (false, true):
                 if recorded.contains(entry.id) {

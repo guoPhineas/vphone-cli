@@ -206,7 +206,7 @@ test-injection-environment:
 test-x1-lowering:
 	@mkdir -p $(OUT)
 	xcrun --sdk macosx clang -Wall -Wextra -Werror -ILaunchHook \
-		-o $(OUT)/X1LoweringTests Tests/X1LoweringTests.c LaunchHook/VPhoneX1Lowering.c
+		-o $(OUT)/X1LoweringTests Tests/X1LoweringTests.c LaunchHook/VPhoneX1Lowering.c LaunchHook/VPhoneCSSCEmulation.c
 	@$(OUT)/X1LoweringTests
 
 # Host proof harness for libdevicename's name decoding, configd publication

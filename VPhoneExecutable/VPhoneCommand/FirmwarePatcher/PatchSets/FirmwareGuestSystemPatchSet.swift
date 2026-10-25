@@ -246,7 +246,7 @@ public enum FirmwareGuestSystemPatchSet {
             VPhonePatchDeclaration(
                 identifier: arm64eX1DyldBootstrap,
                 title: "ARM64E_X1 dyld bootstrap",
-                summary: "Lowers X1 instructions in dyld so launchd can install the host exception handler that translates later faults on demand.",
+                summary: "Lowers X1 and scalar CSSC instructions in dyld so launchd can install the exception handler that translates later faults on demand.",
                 target: .guestExecutable(path: "/usr/lib/dyld"),
                 applicability: ios27,
                 bootEssential: true,
@@ -254,7 +254,7 @@ public enum FirmwareGuestSystemPatchSet {
             VPhonePatchDeclaration(
                 identifier: arm64eX1CacheBootstrap,
                 title: "ARM64E_X1 cache bootstrap",
-                summary: "Lowers only libSystem's pre-constructor X1 code so launchd can install the global on-demand instruction handler.",
+                summary: "Lowers the bootstrap cache's X1 and scalar CSSC code so launchd can install the global on-demand instruction handler.",
                 target: .dyldSharedCache,
                 applicability: ios27,
                 bootEssential: true,
@@ -262,7 +262,7 @@ public enum FirmwareGuestSystemPatchSet {
             VPhonePatchDeclaration(
                 identifier: arm64eX1LaunchdBootstrap,
                 title: "ARM64E_X1 launchd bootstrap",
-                summary: "Lowers PID 1 itself so its injected on-demand instruction handler can become active for the rest of userland.",
+                summary: "Lowers PID 1's X1 and scalar CSSC code so its injected instruction handler can become active for the rest of userland.",
                 target: .guestExecutable(path: "/sbin/launchd"),
                 applicability: ios27,
                 bootEssential: true,

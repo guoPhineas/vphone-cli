@@ -85,10 +85,47 @@ public enum DyldSharedCacheArm64eX1BootstrapPatcher {
         }
         let coreCrypto = selected.first { $0.path == "/usr/lib/system/libcorecrypto.dylib" }!
 
+        // Bootstrap CSSC cannot wait for launchd's exception service. Pool
+        // padding across images, but only where the cache mapping is RX.
+        let cssc = CustomFirmwareCSSC.Padding(makeRanges: {
+            var padding: [Range<Int>] = []
+            var segments: [Range<Int>] = []
+            for info in infos {
+                let prefix = try chunks.bytesAtVMA(info.address, length: 32)
+                guard prefix.loadLE(UInt32.self, at: 0) == 0xFEED_FACF else { continue }
+                let size = Int(prefix.loadLE(UInt32.self, at: 20))
+                guard size <= 1_048_576 else { throw PatcherError.invalidFormat("oversized CSSC cache header") }
+                let header = try chunks.bytesAtVMA(info.address, length: 32 + size)
+                for segment in MachOParser.parseSegments(from: header) where segment.vmSize > 0 {
+                    guard let start = Int(exactly: segment.vmAddr), let length = Int(exactly: segment.vmSize),
+                          length <= Int.max - start else { throw PatcherError.invalidFormat("CSSC cache segment overflow") }
+                    segments.append(start ..< start + length)
+                }
+                for gap in try CustomFirmwareCSSC.padding(in: header, cachedAt: Int(info.address)) {
+                    guard let mapping = chunks.mapping(forVMA: UInt64(gap.lowerBound)), mapping.isExecutable,
+                          UInt64(gap.upperBound) <= mapping.endAddress else { continue }
+                    padding.append(gap)
+                }
+            }
+            // Segment file sizes omit the cache builder's inter-image page
+            // alignment. Exclude every image's segments, require one RX mapping
+            // and an entirely zero-filled tail before admitting that space.
+            for gap in CustomFirmwareCSSC.cacheAlignmentPadding(between: segments) {
+                guard let mapping = chunks.mapping(forVMA: UInt64(gap.lowerBound)), mapping.isExecutable,
+                      UInt64(gap.upperBound) <= mapping.endAddress,
+                      try chunks.bytesAtVMA(UInt64(gap.lowerBound), length: gap.count).allSatisfy({ $0 == 0 })
+                else { continue }
+                padding.append(gap)
+            }
+            return padding
+        }) { address, length in
+            try chunks.bytesAtVMA(UInt64(address), length: length)
+        }
+
         var writes: [Write] = []
         var unvisited = 0
         for image in selected {
-            let result = try planImage(at: image.address, in: chunks)
+            let result = try planImage(at: image.address, in: chunks, cssc: cssc)
             unvisited += result.unvisitedCandidates
             writes += result.records.map {
                 Write(
@@ -98,6 +135,9 @@ public enum DyldSharedCacheArm64eX1BootstrapPatcher {
             }
             log("  [.] X1 bootstrap cache: \(image.path): \(result.records.count) instructions, \(result.unvisitedCandidates) unvisited")
         }
+        let csscRecords = try cssc.finish(log: log)
+        writes += csscRecords.map { Write(address: UInt64($0.fileOffset), word: $0.patchedBytes.loadLE(UInt32.self, at: 0)) }
+        if !csscRecords.isEmpty { log("  [.] CSSC bootstrap: \(csscRecords.count) instruction rewrites planned across all images") }
         writes.sort { $0.address < $1.address }
         log("  [*] X1 bootstrap cache: \(selected.count) image(s), \(writes.count) rewrites, \(unvisited) unvisited candidates")
         guard !dryRun else { return }
@@ -216,6 +256,7 @@ public enum DyldSharedCacheArm64eX1BootstrapPatcher {
     static func planImage(
         at address: UInt64,
         in chunks: DyldSharedCacheChunkSet,
+        cssc: CustomFirmwareCSSC.Padding? = nil,
     ) throws -> CustomFirmwareArm64eX1.Result {
         let prefix = try chunks.bytesAtVMA(address, length: 32)
         guard prefix.loadLE(UInt32.self, at: 0) == 0xFEED_FACF else {
@@ -339,6 +380,7 @@ public enum DyldSharedCacheArm64eX1BootstrapPatcher {
             seeds: seeds,
             excluded: excluded,
             identifier: FirmwareGuestSystemPatchSet.arm64eX1CacheBootstrap,
+            cssc: cssc,
             readMemory: { address, length in
                 return try chunks.bytesAtVMA(UInt64(address), length: length)
             },
